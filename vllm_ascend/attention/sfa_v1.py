@@ -29,6 +29,7 @@ from vllm_ascend.attention.utils import (
     trans_rope_weight,
     transdata,
     wait_for_kv_layer_from_connector,
+    get_kv_cache_from_connector
 )
 from vllm_ascend.distributed.utils import all_gather_async
 from vllm_ascend.ops.layer_shard_linear import (
@@ -141,6 +142,7 @@ class AscendSFAMetadata:
     num_decodes: int = 0
     num_decode_tokens: int = 0
     num_prefills: int = 0
+    num_offload_blocktable: torch.Tensor = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -434,6 +436,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         "skipping sharding configuration"
                     )
             register_all_layers_to_shard_weight_series(self.layer_sharding_kwargs)
+        self.num_offload_blocktable = None
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         # NOTE: We currently do not support quant kv_b_proj.
@@ -581,6 +584,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 epsilon=self.kv_a_layernorm.variance_epsilon,  # type: ignore[union-attr]
                 cache_mode=cache_mode,
             )
+            maybe_save_kv_layer_to_connector(layer_name, list(kv_cache)) 
             return None, None
 
     def rope_single(
@@ -768,6 +772,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             AscendAttentionState.DecodeOnly,
             AscendAttentionState.SpecDecoding,
         }
+        self.num_offload_blocktable = attn_metadata.num_offload_blocktable
 
         if self.enable_mlapo and num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS:
             hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_decode(
@@ -906,28 +911,95 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         return output_padded
 
+    def _get_topk_token(
+        self,
+        topk_indices: torch.Tensor,
+        block_table: torch.Tensor,
+        kv_cache: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        attn_metadata: M,
+        layer_name: str,
+    ):
+        num_batch = topk_indices.shape[0]
+        num_kvhead = self.num_kv_heads
+        head_dim = self.head_dim
+        actual_seq_lengths_key = attn_metadata.sfa_cp_context.actual_seq_lengths_key
+        
+        buffer_key = torch.zeros(num_batch, 2048, num_kvhead, head_dim, 
+                           dtype=kv_cache[0].dtype, device=kv_cache[0].device)
+        buffer_value = torch.zeros(num_batch, 2048, num_kvhead, head_dim, 
+                           dtype=kv_cache[0].dtype, device=kv_cache[0].device)
+        
+        slot_mapping = attn_metadata.slot_mapping
+        max_seq_length = topk_indices.shape[2]
+        device = topk_indices.device
+        block_ids = topk_indices // self.block_size
+        block_table_expanded = block_table.unsqueeze(2).expand(-1, -1, max_seq_length)
+        block_ids_expanded = block_ids.unsqueeze(1).expand(-1, block_table.shape[1], -1)
+
+        is_in_block_table = (block_table_expanded == block_ids_expanded).any(dim=1)
+        num_offload_blocks_tensor = self.num_offload_blocktable.unsqueeze(1).unsqueeze(2)
+        
+        offload_mask = torch.arange(block_table.shape[1], device=device).unsqueeze(0).unsqueeze(2) < num_offload_blocks_tensor
+        is_offload_block = (offload_mask & is_in_block_table).any(dim=1)
+        is_gpu_block = (~is_offload_block) & is_in_block_table
+        seq_mask = torch.arange(max_seq_length, device=device).unsqueeze(0) < actual_seq_lengths_key.unsqueeze(1)
+        valid_mask = seq_mask & (topk_indices >= 0)
+        sparse_seq_lengths_key = (valid_mask & (is_gpu_block | is_offload_block)).sum(dim=2)
+        valid_mask_expanded = valid_mask.unsqueeze(2).expand(-1, -1, -1, num_kvhead)
+        buffer_key = buffer_key * ~valid_mask_expanded
+        buffer_value = buffer_value * ~valid_mask_expanded
+        
+        if is_gpu_block.any():
+            gpu_indices = topk_indices[is_gpu_block]
+            valid_gpu_mask = valid_mask[is_gpu_block]
+            valid_gpu_indices = gpu_indices[valid_gpu_mask]
+            if len(valid_gpu_indices) > 0:
+                valid_slots = slot_mapping[valid_gpu_indices]
+                v_values = kv_cache[1].view(-1, head_dim)[valid_slots]
+                k_values = kv_cache[0].view(-1, head_dim)[valid_slots]
+                gpu_positions = torch.nonzero(is_gpu_block & valid_mask, as_tuple=False)
+                buffer_key[gpu_positions[:, 0], gpu_positions[:, 2]] = k_values
+                buffer_value[gpu_positions[:, 0], gpu_positions[:, 2]] = v_values
+        
+        if is_offload_block.any():
+            cpu_indices = topk_indices[is_offload_block]
+            valid_cpu_mask = valid_mask[is_offload_block]
+            valid_cpu_indices = cpu_indices[valid_cpu_mask]
+            if len(valid_cpu_indices) > 0:
+                cpu_positions = torch.nonzero(is_offload_block & valid_mask, as_tuple=False)
+                cpu_buffer_key = buffer_key[cpu_positions[:, 0], cpu_positions[:, 2]]
+                cpu_buffer_value = buffer_value[cpu_positions[:, 0], cpu_positions[:, 2]]             
+                get_kv_cache_from_connector(layer_name, valid_cpu_indices, 
+                                          cpu_buffer_key, cpu_buffer_value)
+        
+        pad_mask = ~seq_mask
+        buffer_key[pad_mask.unsqueeze(2).expand(-1, -1, num_kvhead * head_dim).view(num_batch, 2048, num_kvhead, head_dim)] = 0
+        buffer_value[pad_mask.unsqueeze(2).expand(-1, -1, num_kvhead * head_dim).view(num_batch, 2048, num_kvhead, head_dim)] = 0
+        
+        return [buffer_key, buffer_value], sparse_seq_lengths_key
+
     def _execute_sparse_flash_attention_process(
         self, ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
     ):
-        block_table = attn_metadata.block_table
-        kv = kv_cache[0]
-        key_rope = kv_cache[1]
-
-        attn_output = torch.ops._C_ascend.npu_sparse_flash_attention(
-            query=ql_nope,
-            key=kv,
-            value=kv,
-            sparse_indices=topk_indices,
-            scale_value=self.scale,
-            sparse_block_size=1,
-            block_table=block_table,
-            actual_seq_lengths_query=actual_seq_lengths_query,
-            actual_seq_lengths_kv=actual_seq_lengths_key,
+        buffer_kv, sparse_seq_lengths_key = self._get_topk_token(
+            topk_indices, kv_cache, attn_metadata, layer_name)
+        attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+            ql_nope,
+            buffer_kv[0],
+            buffer_kv[0],
+            num_heads=self.num_heads,
+            num_key_value_heads=self.num_kv_heads,
+            input_layout="TND",
+            atten_mask=None,
+            scale=self.scale,
+            sparse_mode=0,
+            antiquant_mode=0,
+            antiquant_scale=None,
             query_rope=q_pe,
-            key_rope=key_rope,
-            layout_query="TND",
-            layout_kv="PA_BSND",
-            sparse_mode=3,
+            key_rope=buffer_kv[1],
+            softmax_lse_flag=False,
+            actual_seq_lengths_kv=sparse_seq_lengths_key,
+            actual_seq_lengths=q_seqlens
         )
         return attn_output
 
