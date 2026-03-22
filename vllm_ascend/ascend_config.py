@@ -136,6 +136,8 @@ class AscendConfig:
                     "enable_kv_nz is only supported in pd scenario and can only be used in D node."
                 )
 
+        self.use_offload = bool(additional_config.get("use_offload", False))
+
     def _construct_weight_prefetch_config(self, additional_config):
         weight_prefetch_config = additional_config.get("weight_prefetch_config", {})
         self.weight_prefetch_config = WeightPrefetchConfig(weight_prefetch_config)
