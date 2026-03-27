@@ -1,7 +1,9 @@
 from collections.abc import Iterable
+import copy
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Dict, Any
 
+import numpy as np
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.logger import logger
@@ -130,7 +132,7 @@ class ChunkedTokenDatabase:
         size_list = []
         length = len(self.block_len)
         for i in range(length):
-            addr = self.kv_caches_base_addr[layer_id * length] + block_id * self.block_len[i]
+            addr = self.kv_caches_base_addr[layer_id * length + i] + block_id * self.block_len[i]
             size = int(self.block_len[i] / self.block_size * (end - start))
             addr_list.append(addr)
             size_list.append(size)
@@ -141,6 +143,7 @@ class ChunkedTokenDatabase:
         token_len: int,
         block_hashes: list[BlockHash] | list[str],
         mask_num: int = 0,
+        num_computed_blocks: int = 0,
     ) -> Iterable[tuple[int, int, PoolKey]]:
         """Process the tokens and return the corresponding cache engine keys.
 
@@ -170,8 +173,10 @@ class ChunkedTokenDatabase:
                 for h in block_hashes
             ]
         start_idx = 0
+        offset = num_computed_blocks * self.block_size
         for chunk_id, hash_val in enumerate(block_hashes):
             start_idx = chunk_id * self.block_size
+            start_idx += offset
             if start_idx >= token_len:
                 break
             end_idx = min(start_idx + self.block_size, token_len)
@@ -236,6 +241,9 @@ class RequestTracker:
     # NOTE: This field will only be used when you enable kv-event
     token_ids: list[int] | None = None
 
+    key_gva_mapping: Optional[Dict[str, Any]] = None
+    allocated_block_gvas: np.ndarray | None = None
+
     @staticmethod
     def from_new_request(
         new_request: "NewRequestData",
@@ -268,11 +276,12 @@ class RequestTracker:
     def update(
         self,
         new_block_ids: tuple[list[int], ...] | list[int],
+        new_gvas: np.ndarray,
     ) -> None:
         """Update the request tracker when a running request is
         scheduled again
         """
-        if len(new_block_ids) == 0:
+        if new_block_ids is None or len(new_block_ids) == 0:
             new_block_ids = []
         elif isinstance(new_block_ids, tuple):
             new_block_ids = new_block_ids[0]
@@ -281,6 +290,7 @@ class RequestTracker:
         else:
             raise ValueError(f"Unsupported new_block_ids type {type(new_block_ids)}")
         self.allocated_block_ids.extend(new_block_ids)
+        self.allocated_block_gvas = np.concatenate([self.allocated_block_gvas, new_gvas], axis=-1)
 
 
 @dataclass
@@ -307,6 +317,12 @@ class ReqMeta:
     token_ids: list[int] | None = None
     original_block_size: int | None = None
 
+    key_gva_mapping: Dict[str, Any] = None
+    block_gvas: np.ndarray | None = None # [num_layers, pcp_size, dcp_size, head_or_tp_rank, blocks]
+
+    need_save: bool = True
+    num_new_blocks: int = 0
+
     @staticmethod
     def from_request_tracker(
         tracker: RequestTracker,
@@ -317,6 +333,8 @@ class ReqMeta:
         is_last_chunk: bool | None = None,
         discard_partial_chunks: bool = True,
         original_block_size: int | None = None,
+        need_save: bool = True,
+        num_new_blocks: int = 0,
     ) -> Optional["ReqMeta"]:
         """Create the request metadata from a request tracker.
 
@@ -373,18 +391,22 @@ class ReqMeta:
             req_id=tracker.req_id,
             token_len_chunk=num_tokens_to_save,
             block_ids=tracker.allocated_block_ids,
+            key_gva_mapping=copy.deepcopy(tracker.key_gva_mapping),
+            block_gvas=tracker.allocated_block_gvas,
             can_save=not skip_save,
             load_spec=load_spec,
             block_hashes=block_hashes,
             is_last_chunk=is_last_chunk,
             token_ids=token_ids,
             original_block_size=original_block_size,
+            need_save=need_save,
+            num_new_blocks=num_new_blocks,
         )
 
 
 class AscendConnectorMetadata(KVConnectorMetadata):
     def __init__(self, unfinished_request_ids, preempted_req_ids):
-        self.requests = []
+        self.requests: list[ReqMeta] = []
         self.unfinished_request_ids = unfinished_request_ids
         self.preempted_req_ids = preempted_req_ids
 
