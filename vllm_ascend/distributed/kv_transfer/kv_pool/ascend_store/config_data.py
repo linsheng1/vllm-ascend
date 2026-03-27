@@ -128,15 +128,16 @@ class ChunkedTokenDatabase:
 
     def prepare_value_layer(self, start: int, end: int, block_ids: list[int], layer_id: int):
         block_id = block_ids[start // self.block_size]
-        addr_list = []
-        size_list = []
-        length = len(self.block_len)
-        for i in range(length):
-            addr = self.kv_caches_base_addr[layer_id * length + i] + block_id * self.block_len[i]
-            size = int(self.block_len[i] / self.block_size * (end - start))
-            addr_list.append(addr)
-            size_list.append(size)
-        return addr_list, size_list
+        # addr_list = []
+        # size_list = []
+        # length = len(self.block_len) # 单个block的字节数 K 和 V 的 block_size*num_dead*head_dim
+        # for i in range(length):
+        #     addr = self.kv_caches_base_addr[layer_id * length + i] + block_id * self.block_len[i]
+        #     size = int(self.block_len[i] / self.block_size * (end - start))
+        #     addr_list.append(addr)
+        #     size_list.append(size)
+        return block_id
+        # return addr_list, size_list
 
     def process_tokens(
         self,
@@ -426,6 +427,10 @@ class LasyerMultiBlockReqMeta:
     starts: list[int]
     ends: list[int]
     block_ids: list[int]
+    block_ids_cpu: list[int]
+    block_ids_npu: list[int]
+    cache_npu: list[list[torch.Tensor], list[torch.Tensor]]
+    cache_cpu: list[list[torch.Tensor], list[torch.Tensor]]
     layer_id: int
     is_last_chunk: bool | None = True
     current_event: torch.npu.Event | None = None

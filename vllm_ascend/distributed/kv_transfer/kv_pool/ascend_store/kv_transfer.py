@@ -318,11 +318,39 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         if len(req_metas) == 0:
             return
         key_list = []
-        addr_list = []
-        size_list = []
-        gva_list = []
+        # addr_list = []
+        # size_list = []
+        # gva_list = []
+        
+        blockids_cpu_list = []
+        blockids_list = []
+
         layer_id = req_metas[0].layer_id
         cur_req_ids = set()
+        for req_meta in req_metas:
+            if not self.dcp_size > 1:
+                num_blocks = len(req_meta.keys_str)
+                key_indexes = list(range(self.tp_rank, num_blocks, self.put_step))
+                keys_str = [req_meta.keys_str[i] for i in key_indexes]
+                if len(keys_str) == 0:
+                    continue
+            if not req_meta.keys:
+                if is_last_chunk:
+                    self.set_finished_request(req_meta.req_id)
+                continue
+            for i in range(len(req_meta.block_ids_list)):
+                block_id = req_meta.block_ids_list[i]
+                block_id_cpu = req_meta.block_ids_cpu_list[i]
+                req_meta.cache_cpu[0][layer_id][block_id].copy_(req_meta.kvcaches_npu[0][layer_id][block_id].to("cpu"))
+                req_meta.cache_cpu[1][layer_id][block_id].copy_(req_meta.kvcaches_npu[1][layer_id][block_id].to("cpu"))
+            if layer_id == self.final_layer_id and is_last_chunk: # 研究 is_last_chunk
+                self.set_finished_request(req_meta.req_id)
+        self.layer_save_finished_events[layer_id].set() 
+        req_metas.clear()
+        self.request_queue.task_done()
+        return
+
+
         for req_meta in req_metas:
             cur_req_ids.add(req_meta.req_id)
             starts = req_meta.starts

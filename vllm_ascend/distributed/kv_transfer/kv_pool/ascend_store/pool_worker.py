@@ -299,25 +299,19 @@ class KVPoolWorker:
                 self.kv_recv_thread.start()
                 ready_event.wait()
 
+        self.k_caches_npu = []
+        self.v_caches_npu = []
         if self.use_sparse and self.use_offload:
-            # register topk buffer, get base addr
-            addr_k_list = []
-            addr_v_list = []
             for cache_or_caches in kv_caches.values():
                 assert len(cache_or_caches) == 5
-                topk_buffer_k = cache_or_caches[3]
-                topk_buffer_v = cache_or_caches[4]
-                base_addr_k = topk_buffer_k.data_ptr()
-                base_addr_v = topk_buffer_v.data_ptr()
-                addr_k = torch.arange(base_addr_k, base_addr_k + topk_buffer_k.nelement() * topk_buffer_k.element_size(), self.token_size_bytes_k)
-                addr_v = torch.arange(base_addr_v, base_addr_v + topk_buffer_v.nelement() * topk_buffer_v.element_size(), self.token_size_bytes_v)
-                assert addr_k.size(0) == self.max_num_reqs * self.topk
-                assert addr_v.size(0) == self.max_num_reqs * self.topk
-                addr_k_list.append(addr_k.reshape([self.max_num_reqs, self.topk]))
-                addr_v_list.append(addr_v.reshape([self.max_num_reqs, self.topk]))
-            assert len(addr_k_list) == self.num_layers
-            self.addr_k = torch.stack(addr_k_list, dim=0) # [num_layers, max_num_seqs, topk]
-            self.addr_v = torch.stack(addr_v_list, dim=0)
+                self.k_caches_npu.append(cache_or_caches[0])
+                self.v_caches_npu.append(cache_or_caches[1])
+
+            # register topk buffer, get base addr
+            assert len(self.k_caches_npu) == self.num_layers
+            assert len(self.v_caches_npu) == self.num_layers
+            self.k_caches_cpu = [torch.empty((2048, 128, self.num_kv_head, kv_caches[0].shape[-1]), dtype=torch.bfloat16, device="cpu") for i in range(self.num_layers)]
+            self.v_caches_cpu = [torch.empty((2048, 128, self.num_kv_head, kv_caches[1].shape[-1]), dtype=torch.bfloat16, device="cpu") for i in range(self.num_layers)]
 
     def start_load_kv(self, metadata: AscendConnectorMetadata):
         if self.tp_rank == 0:
@@ -708,26 +702,30 @@ class KVPoolWorker:
         # Preallocate lists with known size
         keys_count = len(req_meta.keys)
         keys_str = []
-        gvas = []  # This list is currently empty but maintained for compatibility
+        # gvas = []  # This list is currently empty but maintained for compatibility
         addr_list = []
         size_list = []
+        block_ids_npu = []
 
         # Generate addr_list and size_list
         # TODO 缓存起来
         for i in range(keys_count):
             keys_str.append(req_meta.keys[i].to_string())
-            addr, size = self.token_database.prepare_value_layer(
+            # addr, size = self.token_database.prepare_value_layer(
+            block_id = self.token_database.prepare_value_layer(
                 starts[i], ends[i], request.block_ids, layer_id)
-            addr_list.extend(addr)
-            size_list.extend(size)
-            gvas.append(request.key_gva_mapping[keys_str[i]])
-            gvas.append(request.key_gva_mapping[keys_str[i]] + self.block_len[0])
+            # addr_list.extend(addr)
+            # size_list.extend(size)
+            block_ids_npu.append(block_id)
+            # gvas.append(request.key_gva_mapping[keys_str[i]])
+            # gvas.append(request.key_gva_mapping[keys_str[i]] + self.block_len[0])
 
         # Avoid deepcopy when possible - use direct assignment since we're creating new lists
         req_meta.keys_str = keys_str
-        req_meta.gvas = gvas
-        req_meta.addr_list = addr_list
-        req_meta.size_list = size_list
+        # req_meta.gvas = gvas
+        req_meta.block_ids_npu = block_ids_npu
+        # req_meta.addr_list = addr_list
+        # req_meta.size_list = size_list
         return
         # req_meta.host_base_addr = request.host_base_addr
         all_blocks = 256
@@ -824,7 +822,7 @@ class KVPoolWorker:
 
         # no cache
         starts, ends, keys = [], [], []
-        for start, end, key in self.token_database.process_tokens(
+        for start, end, key in self.token_database.process_tokens( # 一个block的起点 终点 这个block的哈希值
             current_token_len,
             # current_block_hashes,
             current_block_hashes[-num_new_blocks:],
@@ -935,7 +933,10 @@ class KVPoolWorker:
             if can_save is not None and can_save:
                 req_meta_save = LasyerMultiBlockReqMeta(
                     request.req_id, keys_multi_chunk, starts, ends,
-                    request.block_ids, layer_id, request.is_last_chunk
+                    request.block_ids, request.block_ids_cpu[request.num_new_blocks:], [], [self.k_caches_npu, self.v_caches_npu],
+                    [self.k_caches_cpu, self.v_caches_cpu], kvcaches, kvcaches_cpu, layer_id, 
+                    request.is_last_chunk
+                    # request.block_ids, layer_id, request.is_last_chunk
                 )
 
             # load
