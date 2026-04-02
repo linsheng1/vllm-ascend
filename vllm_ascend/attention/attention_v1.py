@@ -17,6 +17,8 @@
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import ClassVar
+import os
 
 import torch
 import torch_npu
@@ -41,6 +43,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, CrossAttentionSpec
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
+from typing import Optional
 from vllm_ascend.attention.context_parallel.common_cp import AscendMetadataForDecode, AscendMetadataForPrefill
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
@@ -57,6 +60,9 @@ from vllm_ascend.compilation.acl_graph import (
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
 from vllm_ascend.utils import weak_ref_tensors
+from vllm_ascend.worker.kvcomp_utils import KVCompMetaData, KVCompConfig, HashEncoder, recover_request_lengths
+from vllm.logger import init_logger
+logger = init_logger(__name__)
 
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
@@ -202,6 +208,8 @@ class AscendMetadata:
     # sliding window attention mask
     swa_mask: torch.Tensor | None = None
 
+    # kvcomp
+    kvcomp_metadata: Optional[KVCompMetaData] = None
 
 class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
     """
@@ -322,6 +330,24 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             causal=common_attn_metadata.causal,
             model_runner_type=self.model_config.runner_type,
         )
+        if hasattr(common_attn_metadata, "kvcomp_metadata"):
+            real_batch_size = attn_metadata.seq_lens.shape[0]
+            seq_lens_for_hamming = attn_metadata.seq_lens[:real_batch_size].to(device=self.device, non_blocking=True) # attn_metadata.seq_lens_device
+            max_seq_len_for_hamming = torch.max(attn_metadata.seq_lens).item() # 这里会有同步
+            attn_metadata.kvcomp_metadata = common_attn_metadata.kvcomp_metadata
+            attn_metadata.actual_seq_lengths_q_device = recover_request_lengths(query_start_loc)
+            attn_metadata.kvcomp_metadata.seq_lens_for_hamming = seq_lens_for_hamming
+            attn_metadata.kvcomp_metadata.max_seq_len_for_hamming = max_seq_len_for_hamming
+
+            kvcomp_metadata = attn_metadata.kvcomp_metadata
+            kvcomp_config = attn_metadata.kvcomp_metadata.kvcomp_config
+            remainder = attn_metadata.seq_lens % kvcomp_config.chunk_size
+            top_k_for_hamming_cpu = kvcomp_metadata.topk_for_hamming_full_cpu[:real_batch_size]
+            attn_metadata.kvcomp_metadata.hamming_output_seq_lens = torch.where(
+                remainder == 0,\
+                kvcomp_config.chunk_size * top_k_for_hamming_cpu,\
+                kvcomp_config.chunk_size * (top_k_for_hamming_cpu - 1) + remainder
+            )
         return attn_metadata
 
     def build_for_graph_capture(
@@ -384,6 +410,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             self.vllm_config.kv_transfer_config is not None and self.vllm_config.kv_transfer_config.is_kv_producer
         )
         self.sinks = sinks
+        self.layerIndex = None
+        self.enable_kvcomp = os.getenv("VLLM_ASCEND_ENABLE_KVCOMP_SPARSE", "0") == "1"
 
     @staticmethod
     def update_graph_params(
@@ -539,7 +567,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_metadata: AscendMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
+        passed_key = key
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(key, value, attn_metadata)
+        block_table, actual_seq_lengths_kv = self._get_kvcomp_params(query, passed_key, attn_metadata,
+                                                    block_table, actual_seq_lengths_kv)
 
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         if _EXTRA_CTX.is_draft_model:
@@ -758,6 +789,74 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output[:batch_size] = attn_output[:batch_size]
         return output
 
+    def _get_kvcomp_params(self, query: torch.Tensor,
+                                   key: torch.Tensor,
+                                   attn_metadata: AscendMetadata,
+                                   block_table: torch.Tensor,
+                                   actual_seq_lengths_kv: list[int]):
+
+        if not self.enable_kvcomp or attn_metadata.kvcomp_metadata.hashk_caches[self.layerIndex] == None:
+            return block_table, actual_seq_lengths_kv
+        # logger.info("=== self.enable_kvcomp =======")
+        # assert 0 is not 0
+
+        kvcomp_metadata = attn_metadata.kvcomp_metadata
+        kvcomp_config = kvcomp_metadata.kvcomp_config
+
+        if (kvcomp_config.vllm_hash_attention_skip_layers[self.layerIndex] and 
+                attn_metadata.attn_state == AscendAttentionState.DecodeOnly):
+            return kvcomp_metadata.hamming_output, kvcomp_metadata.hamming_output_seq_lens
+        else: # padding, 指定 batch size
+            sink = 1
+            recent =4
+            hash_encoder = kvcomp_metadata.hash_encoder
+            hashk = hash_encoder.compute_hash(key)
+            hashk_op = hashk.transpose(0,1).reshape(-1, hashk.shape[-1]).contiguous()
+            
+            hashk_cache_op = kvcomp_metadata.hashk_caches[self.layerIndex]
+            slot_mapping_op = attn_metadata.slot_mapping
+
+            torch.ops._C_ascend.npu_reshape_and_cache_bnsd(
+                hashk_op,
+                hashk_cache_op,
+                slot_mapping_op,
+                attn_metadata.actual_seq_lengths_q_device, # attn_metadata.query_lens_device
+                hashk_cache_op
+            )
+            if attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
+                return block_table, actual_seq_lengths_kv
+
+            real_batch_size = attn_metadata.seq_lens.shape[0] # 这里是不会padding的。。。
+            seq_lens_for_hamming = kvcomp_metadata.seq_lens_for_hamming
+            max_seq_len_for_hamming = kvcomp_metadata.max_seq_len_for_hamming
+            
+            # max_seq_len_for_hamming = torch.tensor(max_seq_len_for_hamming, dtype=torch.int32)
+            chunk_sizes_for_hamming = kvcomp_metadata.chunk_sizes_for_hamming_full[:real_batch_size]# chunk_sizes_full
+            block_tables_for_hamming = attn_metadata.block_tables[:real_batch_size]
+            top_k_for_hamming = kvcomp_metadata.topk_for_hamming_full[:real_batch_size]
+            top_k_for_hamming_cpu = kvcomp_metadata.topk_for_hamming_full_cpu[:real_batch_size]
+
+            hashq = hash_encoder.compute_hash(query[:real_batch_size])
+            hashq = hashq.unsqueeze(2).contiguous()    
+            new_block_table = torch.ops._C_ascend.npu_hamming_dist_top_k(
+                hashq,
+                hashk_cache_op,
+                None,
+                top_k_for_hamming,
+                seq_lens_for_hamming,
+                chunk_sizes_for_hamming,
+                max_seq_len_for_hamming,
+                sink,
+                recent,
+                None,
+                block_tables_for_hamming,
+                None,
+                kvcomp_metadata.hamming_output[:real_batch_size]
+            )
+            new_block_table = new_block_table.squeeze(1).contiguous()
+            kvcomp_metadata.hamming_output = new_block_table
+        return new_block_table, kvcomp_metadata.hamming_output_seq_lens
+
     def forward_fused_infer_attention(
         self,
         query: torch.Tensor,
@@ -780,7 +879,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
             and self.sinks is None
         ):
             return self._forward_fia_slidingwindow(query, attn_metadata, output)
+        passed_key = key
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(key, value, attn_metadata)
+        block_table, actual_seq_lengths_kv = self._get_kvcomp_params(query, passed_key, attn_metadata,
+                                                    block_table, actual_seq_lengths_kv)
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         query = query[:num_tokens]
         if (
@@ -971,6 +1073,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             shape = [num_tokens, num_heads * head_size]
         """
         assert output is not None, "Output tensor must be provided."
+        self.layerIndex = int(layer.layer_name.split('.')[2])
 
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError("fused output quantization is not yet supported for AscendAttentionBackendImpl")
