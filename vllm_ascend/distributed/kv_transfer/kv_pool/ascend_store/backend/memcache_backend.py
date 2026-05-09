@@ -18,6 +18,7 @@ class MmcDirect(Enum):
 
 class MemcacheBackend(Backend):
     def __init__(self, parallel_config: ParallelConfig):
+        return
         try:
             from memcache_hybrid import DistributedObjectStore  # type: ignore
         except ImportError as e:
@@ -52,10 +53,12 @@ class MemcacheBackend(Backend):
             raise
 
     def set_device(self):
+        return
         device = torch.device(f"npu:{self.rank}")
         torch.npu.set_device(device)
 
     def register_buffer(self, ptrs: list[int], sizes: list[int]):
+        return
         soc_version = get_ascend_device_type()
         if soc_version in {AscendDeviceType.A2}:
             for ptr, size in zip(ptrs, sizes):

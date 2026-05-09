@@ -1,17 +1,21 @@
 from dataclasses import dataclass, field
 from functools import lru_cache
+from threading import Lock
 from typing import Any
 
 import torch
 import torch.nn.functional as F
+import torch_npu
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group, is_v1_kv_transfer_group
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+from vllm.logger import logger
 
 from vllm_ascend import envs
-from vllm_ascend.utils import AscendDeviceType, get_ascend_config, get_ascend_device_type
+from vllm_ascend.utils import AscendDeviceType, get_ascend_config, get_ascend_device_type, get_subscribed_compute_streams
 
+from vllm_ascend.utils import acl_graph_print
 
 def ascend_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
     scheduler_config = vllm_config.scheduler_config
@@ -158,6 +162,11 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # Metadata for Prefill Context Parallelism (PCP) operations.
     prefill_context_parallel_metadata: AscendPrefillContextParallelMetadata | None = None
 
+    indexer_block_table_tensor: torch.Tensor | None = None
+    indexer_slot_mapping: torch.Tensor | None = None
+    num_offloaded_blocks: torch.Tensor | None = None
+    req_ids_tensor: torch.Tensor | None = None
+
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
         # This only use to eagle now. It will be use to enforce_eager in future.
@@ -286,6 +295,42 @@ def maybe_save_kv_layer_to_connector(
         return
     # TODO: assert ascendMetadata
     connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
+
+
+def set_connector_req_ids(req_ids):
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+    connector = get_kv_transfer_group()
+    if not hasattr(connector, 'set_req_ids'):
+        return
+    connector.set_req_ids(req_ids)
+
+
+def maybe_load_kv_token_wise_graph(
+    layer_name: str,
+    num_reqs: int,
+    token_indices: torch.Tensor, # [num_reqs, topk]
+    cpu_mask: torch.Tensor,
+    capturing: bool = False,
+):
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+    connector = get_kv_transfer_group()
+    if not hasattr(connector, 'load_kv_token_wise'):
+        return
+    connector.load_kv_token_wise(layer_name, num_reqs, token_indices, cpu_mask, capturing)
+
+
+def maybe_save_kv_layer_to_connector_graph(
+    layer_name: str,
+    capturing: bool = False,
+):
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+    connector = get_kv_transfer_group()
+    if not hasattr(connector, 'save_kv_offload'):
+        return
+    connector.save_kv_offload(layer_name, capturing)
 
 
 def round_up(val: int, align: int) -> int:

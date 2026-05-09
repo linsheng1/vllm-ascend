@@ -167,6 +167,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
             starts.append(start)
             ends.append(end)
             keys.append(key.to_string())
+        if torch.distributed.get_rank() == 0:
+            logger.info(f'>>>>> kv sending thread handle request, size={len(keys)}')
 
         if not self.dcp_size > 1:
             starts = starts[self.tp_rank % self.put_step :: self.put_step]
@@ -273,6 +275,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             key_list.append(key.to_string())
             addr_list.append(addr)
             size_list.append(size)
+        if torch.distributed.get_rank() == 0:
+            logger.info(f'>>>>> kv recving thread handle request, size={len(key_list)}')
         key_list_c = key_list[self.tp_rank % len(key_list) :] + key_list[: self.tp_rank % len(key_list)]
         addr_list_c = addr_list[self.tp_rank % len(addr_list) :] + addr_list[: self.tp_rank % len(addr_list)]
         size_list_c = size_list[self.tp_rank % len(size_list) :] + size_list[: self.tp_rank % len(size_list)]
@@ -293,6 +297,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         ready_event: threading.Event,
         num_layers: int,
         enable_kv_event: bool = False,
+        layer_save_finished_events: list[threading.Event] = [],
     ):
         super().__init__(
             m_store, token_database, block_size, tp_rank, dcp_size, ready_event, name="KVCacheStoreLayerSendingThread"
@@ -300,6 +305,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self.final_layer_id = num_layers - 1
         self.put_step = put_step
         self.enable_kv_event = enable_kv_event
+        self.layer_save_finished_events = layer_save_finished_events
 
     def add_request(  # type: ignore[override]
         self, req_meta: ReqMeta
@@ -307,8 +313,132 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self.request_queue.put(req_meta)
 
     def _handle_request(  # type: ignore[override]
-        self, req_meta: LasyerMultiBlockReqMeta
+        self, req_metas: list[LasyerMultiBlockReqMeta]
     ):
+        # logger.info(f'>>>>> handle request, req_metas = {len(req_metas)}')
+        if len(req_metas) == 0:
+            return
+        # if isinstance(req_metas[0], int):
+        #     # logger.info(f'>>>>> no save, return, layer_id = {req_metas[0]}')
+        #     layer_id = req_metas[0]
+        #     req_metas.clear()
+        #     self.request_queue.task_done()
+        #     self.layer_save_finished_events[layer_id].set()
+        #     return
+
+        key_list = []
+        addr_list = []
+        size_list = []
+        gva_list = []
+        layer_id = req_metas[0].layer_id
+
+        for req_meta in req_metas:
+            req_id = req_meta.req_id
+            is_last_chunk = req_meta.is_last_chunk
+            block_ids_npu = req_meta.block_ids_npu
+            block_ids_cpu = req_meta.block_ids_cpu
+            (k_cache_npu, v_cache_npu) = req_meta.cache_npu
+            (k_cache_cpu, v_cache_cpu) = req_meta.cache_cpu
+            if len(block_ids_npu) != len(block_ids_cpu):
+                logger.error(
+                    f'Offload req {req_id} fail! '
+                    f'npu block num ({len(block_ids_npu)}) '
+                    f'cpu block num ({len(block_ids_cpu)}) size mismatch'
+                )
+            if self.tp_rank == 0 and layer_id == 0:
+                logger.info(f'>>>>> kv sending thread offload {len(block_ids_npu)} blocks of req {req_id}')
+            k_cache_cpu[block_ids_cpu] = k_cache_npu[block_ids_npu].to('cpu')
+            v_cache_cpu[block_ids_cpu] = v_cache_npu[block_ids_npu].to('cpu')
+
+            if layer_id == self.final_layer_id and is_last_chunk:
+                # seem useless, need to check
+                self.set_finished_request(req_meta.req_id)
+
+        req_metas.clear()
+        self.request_queue.task_done()
+        self.layer_save_finished_events[layer_id].set()
+        return
+
+        # mmc based offload
+        cur_req_ids = set()
+        for req_meta in req_metas:
+            cur_req_ids.add(req_meta.req_id)
+            starts = req_meta.starts
+            ends = req_meta.ends
+            keys = req_meta.keys
+            # current_event = req_meta.current_event
+            total_block = len(keys)
+            is_last_chunk = req_meta.is_last_chunk
+            # logger.info(f'>>>>> kv sending thread ori, rank {self.tp_rank}, process req {req_meta.req_id}, keys={len(req_meta.keys_str)}, gvas={len(req_meta.gvas)}, addr={len(req_meta.addr_list)}, size={len(req_meta.size_list)}')
+            if not self.dcp_size > 1:
+                # gvas_i = req_meta.gvas[self.tp_rank % self.put_step::self.put_step]
+                # keys_str = req_meta.keys_str[self.tp_rank % self.put_step::self.put_step]
+                # addr_list_i = req_meta.addr_list[self.tp_rank % self.put_step::self.put_step]
+                # size_list_i = req_meta.size_list[self.tp_rank % self.put_step::self.put_step]
+                num_blocks = len(req_meta.keys_str)
+                key_indexes = list(range(self.tp_rank, num_blocks, self.put_step))
+                addr_indexes = []
+                for key_index in key_indexes:
+                    addr_indexes.extend([key_index * 2, key_index * 2 + 1])
+                # logger.info(f'>>>>> kv sending thread indexes, rank {self.tp_rank}, process req {req_meta.req_id}, key_indexes={key_indexes}, addr_indexes={addr_indexes}')
+                keys_str = [req_meta.keys_str[i] for i in key_indexes]
+                gvas_i = [req_meta.gvas[i] for i in addr_indexes]
+                addr_list_i = [req_meta.addr_list[i] for i in addr_indexes]
+                size_list_i = [req_meta.size_list[i] for i in addr_indexes]
+                if len(keys_str) == 0:
+                    continue
+            # TODO there maybe has some problem when only have one block.
+            if not keys:
+                if is_last_chunk:
+                    self.set_finished_request(req_meta.req_id)
+                continue
+            # keys_str = []
+            # for key in keys:
+            #     keys_str.append(key.to_string())
+            # if 'last' not in keys_str[-1]:
+            #     continue
+            skip_block_num = self.lookup(keys_str) # TODO check skip_block_num
+            # TODO check this
+            if skip_block_num == len(keys_str):
+                if is_last_chunk and layer_id == self.final_layer_id:
+                    self.set_finished_request(req_meta.req_id)
+                continue
+
+            # gvas.extend(gvas_i)
+            # addr_list.extend(addr_list_i)
+            # size_list.extend(size_list_i)
+
+            # logger.info(f'>>>>> kv sending thread size before skip, rank {self.tp_rank}, process req {req_meta.req_id}, key_size={len(keys_str)}, gva_size={len(gvas_i)}, addr_size={len(addr_list_i)}, skip={skip_block_num}')
+            key_list.extend(keys_str[skip_block_num:])
+            gva_list.extend(gvas_i[skip_block_num * 2:]) # 1 block, 1 key, 1 skip, 2 gvas/size/addr (k&v)
+            size_list.extend(size_list_i[skip_block_num * 2:])
+            addr_list.extend(addr_list_i[skip_block_num * 2:])
+
+            if layer_id == self.final_layer_id and is_last_chunk:
+                self.set_finished_request(req_meta.req_id)
+
+        # self.sync_save_events[layer_id].synchronize()
+
+        if len(key_list) > 0:
+            if self.tp_rank == 0 and layer_id == 0:
+                logger.info(f'>>>>> kv sending thread batch_copy, rank {self.tp_rank}, gva_list = {len(gva_list)}, addr_list = {len(addr_list)}, size_list = {len(size_list)}, key_list={len(key_list)}')
+            res = self.m_store.store.batch_copy(gva_list, addr_list, size_list, 0)
+            # if res != 0:
+            #     logger.info(
+            #         f"send failed {res} gva_list {gva_list} addr_list {addr_list} size_list {size_list} key_list {key_list}")
+            # else:
+            #     logger.info(f'send success!')
+
+        # assert not self.layer_save_finished_events                [layer_id].is_set(), f"thread: {layer_id} save failed "
+        # logger.info(f'>>>>> kv sending thread finish layer {layer_id}')
+        self.layer_save_finished_events[layer_id].set()
+        req_metas.clear()
+        self.request_queue.task_done()
+
+        return
+
+        if torch.distributed.get_rank() == 0:
+            logger.info(f'>>>>> kv layer sending thread handle request, size={len(req_meta.keys) if req_meta.keys else None}')
         starts = req_meta.starts
         ends = req_meta.ends
         keys = req_meta.keys
@@ -401,6 +531,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             key_list.append(key.to_string())
             addr_list.append(addr)
             size_list.append(size)
+        if torch.distributed.get_rank() == 0:
+            logger.info(f'>>>>> kv layer recving thread handle request, size={len(key_list)}')
         key_list_c = key_list[self.tp_rank % len(key_list) :] + key_list[: self.tp_rank % len(key_list)]
         addr_list_c = addr_list[self.tp_rank % len(addr_list) :] + addr_list[: self.tp_rank % len(addr_list)]
         size_list_c = size_list[self.tp_rank % len(size_list) :] + size_list[: self.tp_rank % len(size_list)]

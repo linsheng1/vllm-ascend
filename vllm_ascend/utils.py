@@ -134,6 +134,10 @@ def _unregister_print_streams_on_exit():
 atexit.register(_unregister_print_streams_on_exit)
 
 
+def get_subscribed_compute_streams() -> set:
+    return _SUBSCRIBED_COMPUTE_STREAMS
+
+
 def _should_trans_nz(weight: torch.Tensor) -> bool:
     # FP32 cannot use NZ.
     if weight.dtype == torch.float32:
