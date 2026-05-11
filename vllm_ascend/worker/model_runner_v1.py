@@ -2487,12 +2487,151 @@ class NPUModelRunner(GPUModelRunner):
             if self.lora_config:
                 self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
         self.model_memory_usage = m.consumed_memory
+        self._setup_moe_offload_hooks()
+        self._load_moe_weights_to_cpu()
         logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2**30))
 
         # wrap the model with full graph wrapper if needed.
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
             self.model = ACLGraphWrapper(self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
+
+    def _setup_moe_offload_hooks(self) -> None:
+        """Wire up ExpertOffloadHook to all MoE layers after model loading."""
+        # Import here to avoid circular imports
+        from vllm_ascend.model_executor.layers.fused_moe.offload.expert_offload_hook import (
+            ExpertOffloadHook,
+        )
+
+        # Find all AscendFusedMoE instances in the model
+        moe_layers = []
+        for module in self.model.modules():
+            if hasattr(module, "set_offload_hook") and hasattr(module, "moe_instance_id"):
+                moe_layers.append(module)
+
+        if not moe_layers:
+            return
+
+        # Get parameters from first MoE layer's config
+        first_moe = moe_layers[0]
+        num_experts = first_moe.moe_config.num_experts
+        hidden_dim = first_moe.moe_config.hidden_dim
+        intermediate_size = first_moe.moe_config.intermediate_size_per_partition
+        expert_shape = (hidden_dim, intermediate_size)
+
+        # num_layers = total MoE layer count
+        num_layers = len(moe_layers)
+
+        # Create ONE shared hook
+        hook = ExpertOffloadHook(
+            num_layers=num_layers,
+            num_experts=num_experts,
+            expert_shape=expert_shape,
+        )
+
+        # Attach to all MoE layers
+        for moe_layer in moe_layers:
+            moe_layer.set_offload_hook(hook)
+
+        logger.info(
+            "MoE offload hooks wired: %d layers, %d experts, shape=%s",
+            num_layers,
+            num_experts,
+            expert_shape,
+        )
+
+    def set_moe_offload_buffers(self, cpu_buffers: dict[int, torch.Tensor] | None = None) -> None:
+        """Set CPU expert weight buffers for offload.
+
+        Args:
+            cpu_buffers: dict mapping global expert_id -> CPU weight tensor.
+                        Caller is responsible for building the complete mapping
+                        from all MoE layers.
+        """
+        if cpu_buffers is None:
+            return
+
+        # All MoE layers share the same hook instance, so we only need to set once
+        for module in self.model.modules():
+            if hasattr(module, "_offload_hook") and module._offload_hook is not None:
+                module._offload_hook.set_buffers(cpu_buffers)
+                break
+
+    def _load_moe_weights_to_cpu(self) -> None:
+        """Load MoE expert weights from NPU to CPU for offload.
+
+        Collects expert weights (w13 and w2) from all MoE layers after model
+        weights are loaded, and provides them to the ExpertOffloadHook via
+        set_moe_offload_buffers(). This must be called after model weights are
+        loaded and _setup_moe_offload_hooks() has been called.
+        """
+        # Find all MoE layers that have the offload hook set
+        moe_layers = []
+        for module in self.model.modules():
+            if hasattr(module, "_offload_hook") and module._offload_hook is not None:
+                if hasattr(module, "moe_instance_id"):
+                    moe_layers.append(module)
+
+        if not moe_layers:
+            return
+
+        # Collect CPU buffers from all MoE layers
+        # cpu_buffers maps global_expert_id -> CPU tensor
+        cpu_buffers: dict[int, torch.Tensor] = {}
+
+        for moe_layer in moe_layers:
+            # Get the expert weights from this layer
+            # w13_weight shape: [local_num_experts, 2, intermediate_size, hidden_dim]
+            # w2_weight shape: [local_num_experts, hidden_dim, intermediate_size]
+            w13_weight = moe_layer.w13_weight
+            w2_weight = moe_layer.w2_weight
+
+            # Get the expert mapping for this layer (maps local expert id to global)
+            expert_map = getattr(moe_layer, "_expert_map", None)
+            local_num_experts = moe_layer.moe_config.num_local_experts
+
+            for local_expert_id in range(local_num_experts):
+                # Map local expert id to global expert id
+                if expert_map is not None:
+                    global_expert_id = expert_map[local_expert_id].item()
+                    # Skip experts not on this rank (marked as -1 in expert_map)
+                    if global_expert_id == -1:
+                        continue
+                else:
+                    global_expert_id = local_expert_id
+
+                # Get w13 and w2 weights for this expert
+                # w13 contains both gate (w1) and up (w3) projections
+                w13_expert = w13_weight.data[local_expert_id]  # [2, intermediate_size, hidden_dim]
+                w2_expert = w2_weight.data[local_expert_id]  # [hidden_dim, intermediate_size]
+
+                # Stack w13 and w2 into a single tensor for the offload hook
+                # The hook expects shape (hidden_dim, intermediate_size) per expert
+                # We'll store the combined w13+w2 tensor (requires concatenation)
+                # Shape: [2 * intermediate_size + hidden_dim, hidden_dim] after flatten?
+                # Actually the hook stores per-expert weights, so we need to match expert_shape
+                # expert_shape = (hidden_dim, intermediate_size)
+                # We need to store both w1/w3 (gate/up) and w2 (down) projections
+                # For simplicity, concatenate w13 and w2 along the intermediate dimension
+                # Resulting shape: [hidden_dim, intermediate_size * 3] (w1, w3, w2)
+                intermediate_size = w2_expert.shape[1]
+                hidden_dim = w2_expert.shape[0]
+
+                # Reorder w13 from [2, intermediate_size, hidden_dim] to [hidden_dim, intermediate_size]
+                w13_expert = w13_expert.permute(2, 1, 0).contiguous()  # [hidden_dim, intermediate_size, 2]
+                # Flatten the last two dims to get [hidden_dim, intermediate_size * 2]
+                w13_combined = w13_expert.view(hidden_dim, intermediate_size * 2)
+
+                # Concatenate w13_combined and w2: [hidden_dim, intermediate_size * 3]
+                combined_weight = torch.cat([w13_combined, w2_expert], dim=1)
+
+                # Move to CPU
+                cpu_buffers[global_expert_id] = combined_weight.cpu()
+
+        # Set the CPU buffers on the offload hook
+        self.set_moe_offload_buffers(cpu_buffers)
+
+        logger.info("MoE expert weights loaded to CPU: %d experts", len(cpu_buffers))
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
