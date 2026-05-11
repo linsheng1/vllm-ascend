@@ -326,6 +326,10 @@ class AscendFusedMoE(FusedMoE):
         if not vllm_version_is("0.16.0"):
             self.runner = self._init_runner()
 
+    def set_offload_hook(self, hook) -> None:
+        """Set the expert weight offload hook for this MoE layer."""
+        self._offload_hook = hook
+
     if not vllm_version_is("0.16.0"):
 
         def _init_runner(self):
@@ -437,6 +441,11 @@ class AscendFusedMoE(FusedMoE):
 
                 set_flash_common3_context(topk_weights=topk_weights, topk_ids=topk_ids)
 
+                # === OFFLOAD HOOK: Capture routing decision (line 438) ===
+                if hasattr(self, '_offload_hook') and self._offload_hook is not None:
+                    self._offload_hook.on_routing(self.moe_instance_id, topk_ids)
+                # ==========================================================
+
         hidden_states, router_logits, mc2_mask, context_metadata = forward_context.moe_comm_method.prepare(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -453,6 +462,11 @@ class AscendFusedMoE(FusedMoE):
             hidden_states, pertoken_scale = hidden_states
         else:
             pertoken_scale = None
+
+        # === OFFLOAD HOOK: Layer compute start (line ~457, before quant_method.apply) ===
+        if hasattr(self, '_offload_hook') and self._offload_hook is not None:
+            self._offload_hook.on_layer_compute_start(self.moe_instance_id)
+        # =================================================================================
 
         # Matrix multiply.
         fused_experts_results: FusedExpertsResult = self.quant_method.apply(
@@ -496,6 +510,11 @@ class AscendFusedMoE(FusedMoE):
             reduce_results=self.reduce_results,
             context_metadata=context_metadata,
         )
+
+        # === OFFLOAD HOOK: Layer compute end (line ~508, after finalize) ===
+        if hasattr(self, '_offload_hook') and self._offload_hook is not None:
+            self._offload_hook.on_layer_compute_end(self.moe_instance_id)
+        # ==================================================================
 
         if return_with_event:
             return FusedMoEResult(
