@@ -578,6 +578,8 @@ class ExpertOffloadConfig:
         "num_device_experts": 32,
         "num_device_layers": 2,
         "expert_map_path": None,
+        "expert_tensor_dump_enabled": False,
+        "expert_tensor_dump_path": None,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -615,6 +617,12 @@ class ExpertOffloadConfig:
             raise ValueError(f"num_device_layers must >= 1; got {self.config['num_device_layers']} instead")
         if not isinstance(self.config["expert_offload"], bool):
             raise TypeError("expert_offload must be a boolean")
+        if not isinstance(self.config["expert_tensor_dump_enabled"], bool):
+            raise TypeError("expert_tensor_dump_enabled must be a boolean")
+        if self.config["expert_tensor_dump_path"] is not None and not isinstance(
+            self.config["expert_tensor_dump_path"], str
+        ):
+            raise TypeError("expert_tensor_dump_path must be a string or None")
 
 
 _ASCEND_CONFIG: AscendConfig | None = None

@@ -1,5 +1,8 @@
 """Expert Offload Manager — manages CPU-side expert weights and NPU paging."""
 
+import atexit
+from pathlib import Path
+
 import torch
 import torch_npu
 from vllm.config import VllmConfig
@@ -60,6 +63,12 @@ class ExpertOffloadManager:
 
         self.num_device_layers = self.offload_config.num_device_layers
         self.num_total_experts = None  # set in create_weights
+        self._expert_tensor_dump_enabled = self.offload_config.expert_tensor_dump_enabled
+        self._expert_tensor_dump_path = self.offload_config.expert_tensor_dump_path or "expert_tensor_dump.pt"
+        self._expert_tensor_dump_records: list[dict[str, int | torch.Tensor]] = []
+        self._expert_tensor_dump_calls: list[int] = []
+        self._expert_tensor_dump_registered = False
+        self._expert_tensor_dump_flushed = False
 
         ExpertOffloadManager._instance = self
 
@@ -106,6 +115,11 @@ class ExpertOffloadManager:
         self._drain_pending_weights()
 
         self.num_total_experts = num_total_experts
+        if self._expert_tensor_dump_enabled:
+            self._expert_tensor_dump_calls = [0 for _ in range(num_moe_layers)]
+            if not self._expert_tensor_dump_registered:
+                atexit.register(self._flush_expert_tensor_dump)
+                self._expert_tensor_dump_registered = True
 
         # update weights related buffers
         self.topk_ids_h = torch.zeros([self.offload_threshold, self.topk], dtype=torch.int32, device='cpu', pin_memory=True)
@@ -532,6 +546,7 @@ class ExpertOffloadManager:
         with torch_npu.npu.stream(self.load_stream):
             unique_experts = topk_ids_h.unique().tolist()
             needed = set(unique_experts)
+            self._record_expert_tensor_dump(layer_idx, needed)
 
             # Build reverse map: slot → expert_id currently occupying it
             slot_owner: dict[int, int] = {}
@@ -609,6 +624,42 @@ class ExpertOffloadManager:
     # ------------------------------------------------------------------ #
     #  Internal helpers                                                    #
     # ------------------------------------------------------------------ #
+
+    def _record_expert_tensor_dump(self, layer_idx: int, needed: set[int]) -> None:
+        if not self._expert_tensor_dump_enabled:
+            return
+        if layer_idx >= len(self._expert_tensor_dump_calls):
+            return
+        self._expert_tensor_dump_calls[layer_idx] += 1
+        experts = torch.tensor(sorted(needed), dtype=torch.int32, device="cpu")
+        self._expert_tensor_dump_records.append(
+            {
+                "step": self._expert_tensor_dump_calls[layer_idx],
+                "layer": layer_idx,
+                "experts": experts,
+            }
+        )
+
+    def _flush_expert_tensor_dump(self) -> None:
+        if not self._expert_tensor_dump_enabled or self._expert_tensor_dump_flushed:
+            return
+        self._expert_tensor_dump_flushed = True
+        if not self._expert_tensor_dump_records:
+            return
+        path = Path(self._expert_tensor_dump_path).expanduser()
+        if path.parent != Path("."):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "metadata": {
+                "num_layers": len(self._expert_tensor_dump_calls),
+                "num_total_experts": self.num_total_experts,
+                "num_device_experts": self.num_device_experts,
+                "topk": self.topk,
+            },
+            "records": self._expert_tensor_dump_records,
+        }
+        torch.save(payload, path)
+        logger.info("Saved expert tensor dump with %d records to %s", len(self._expert_tensor_dump_records), path)
 
     def _drain_pending_weights(self):
         if not self._pending_weights:
