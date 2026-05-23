@@ -16,9 +16,11 @@ import torch
 
 @dataclass
 class OverlapEvent:
+    scenario: str
     step: int
     prev_step: int
     layer: int
+    prev_layer: int
     overlap: int
     current_count: int
     previous_count: int
@@ -60,9 +62,16 @@ class Bucket:
 class Summary:
     metadata: dict
     events: list[OverlapEvent]
-    layers: dict[int, Bucket]
-    steps: dict[int, Bucket]
-    global_bucket: Bucket
+    scenarios: dict[str, Bucket]
+    layers: dict[str, dict[int, Bucket]]
+    steps: dict[str, dict[int, Bucket]]
+
+
+SCENARIOS = (
+    "prev_step_same_layer",
+    "same_step_prev_layer",
+    "union_prev_step_or_prev_layer",
+)
 
 
 def _torch_load(path: str) -> dict:
@@ -98,34 +107,63 @@ def summarize(path: str, lag: int = 1) -> Summary:
     events: list[OverlapEvent] = []
 
     for (step, layer), current in sorted(by_key.items()):
-        previous = by_key.get((step - lag, layer))
-        if previous is None:
-            continue
-        events.append(
-            OverlapEvent(
-                step=step,
-                prev_step=step - lag,
-                layer=layer,
-                overlap=len(current & previous),
-                current_count=len(current),
-                previous_count=len(previous),
+        prev_step = by_key.get((step - lag, layer))
+        prev_layer = by_key.get((step, layer - 1))
+        if prev_step is not None:
+            events.append(
+                OverlapEvent(
+                    scenario="prev_step_same_layer",
+                    step=step,
+                    prev_step=step - lag,
+                    layer=layer,
+                    prev_layer=layer,
+                    overlap=len(current & prev_step),
+                    current_count=len(current),
+                    previous_count=len(prev_step),
+                )
             )
-        )
+        if prev_layer is not None:
+            events.append(
+                OverlapEvent(
+                    scenario="same_step_prev_layer",
+                    step=step,
+                    prev_step=step,
+                    layer=layer,
+                    prev_layer=layer - 1,
+                    overlap=len(current & prev_layer),
+                    current_count=len(current),
+                    previous_count=len(prev_layer),
+                )
+            )
+        if prev_step is not None or prev_layer is not None:
+            union = (prev_step or set()) | (prev_layer or set())
+            events.append(
+                OverlapEvent(
+                    scenario="union_prev_step_or_prev_layer",
+                    step=step,
+                    prev_step=step - lag if prev_step is not None else step,
+                    layer=layer,
+                    prev_layer=layer - 1 if prev_layer is not None else layer,
+                    overlap=len(current & union),
+                    current_count=len(current),
+                    previous_count=len(union),
+                )
+            )
 
-    layers: dict[int, Bucket] = defaultdict(Bucket)
-    steps: dict[int, Bucket] = defaultdict(Bucket)
-    global_bucket = Bucket()
+    scenarios: dict[str, Bucket] = defaultdict(Bucket)
+    layers: dict[str, dict[int, Bucket]] = defaultdict(lambda: defaultdict(Bucket))
+    steps: dict[str, dict[int, Bucket]] = defaultdict(lambda: defaultdict(Bucket))
     for event in events:
-        layers[event.layer].add(event)
-        steps[event.step].add(event)
-        global_bucket.add(event)
+        scenarios[event.scenario].add(event)
+        layers[event.scenario][event.layer].add(event)
+        steps[event.scenario][event.step].add(event)
 
     return Summary(
         metadata=metadata,
         events=events,
-        layers=dict(layers),
-        steps=dict(steps),
-        global_bucket=global_bucket,
+        scenarios=dict(scenarios),
+        layers={scenario: dict(bucket) for scenario, bucket in layers.items()},
+        steps={scenario: dict(bucket) for scenario, bucket in steps.items()},
     )
 
 
@@ -155,44 +193,57 @@ def _json_summary(summary: Summary, lag: int) -> dict:
     return {
         "metadata": summary.metadata,
         "lag": lag,
-        "global": _bucket_json(summary.global_bucket),
+        "global": {
+            scenario: _bucket_json(summary.scenarios.get(scenario, Bucket()))
+            for scenario in SCENARIOS
+        },
         "layers": {
-            str(layer): _bucket_json(bucket)
-            for layer, bucket in sorted(summary.layers.items())
+            scenario: {
+                str(layer): _bucket_json(bucket)
+                for layer, bucket in sorted(summary.layers.get(scenario, {}).items())
+            }
+            for scenario in SCENARIOS
         },
         "steps": {
-            str(step): _bucket_json(bucket)
-            for step, bucket in sorted(summary.steps.items())
+            scenario: {
+                str(step): _bucket_json(bucket)
+                for step, bucket in sorted(summary.steps.get(scenario, {}).items())
+            }
+            for scenario in SCENARIOS
         },
     }
 
 
 def _print_table(summary: Summary, lag: int, top_steps: int) -> None:
     print("GLOBAL")
-    print(
-        f"  lag={lag} pairs={summary.global_bucket.pairs} "
-        f"overlap={summary.global_bucket.overlap} current={summary.global_bucket.current_count} "
-        f"previous={summary.global_bucket.previous_count} rate={summary.global_bucket.rate:.6f} "
-        f"jaccard={summary.global_bucket.jaccard:.6f}"
-    )
+    print("scenario,lag,pairs,overlap,current,previous,rate,jaccard")
+    for scenario in SCENARIOS:
+        bucket = summary.scenarios.get(scenario, Bucket())
+        print(
+            f"{scenario},{lag},{bucket.pairs},{bucket.overlap},{bucket.current_count},"
+            f"{bucket.previous_count},{bucket.rate:.6f},{bucket.jaccard:.6f}"
+        )
 
     print("\nPER_LAYER")
-    print("layer,pairs,overlap,current,previous,rate,jaccard")
-    for layer, bucket in sorted(summary.layers.items()):
-        print(
-            f"{layer},{bucket.pairs},{bucket.overlap},{bucket.current_count},"
-            f"{bucket.previous_count},{bucket.rate:.6f},{bucket.jaccard:.6f}"
-        )
+    print("scenario,layer,pairs,overlap,current,previous,rate,jaccard")
+    for scenario in SCENARIOS:
+        for layer, bucket in sorted(summary.layers.get(scenario, {}).items()):
+            print(
+                f"{scenario},{layer},{bucket.pairs},{bucket.overlap},{bucket.current_count},"
+                f"{bucket.previous_count},{bucket.rate:.6f},{bucket.jaccard:.6f}"
+            )
 
     print("\nPER_STEP")
-    print("step,layer_pairs,overlap,current,previous,rate,jaccard")
-    for step, bucket in sorted(summary.steps.items())[:top_steps]:
-        print(
-            f"{step},{bucket.pairs},{bucket.overlap},{bucket.current_count},"
-            f"{bucket.previous_count},{bucket.rate:.6f},{bucket.jaccard:.6f}"
-        )
-    if len(summary.steps) > top_steps:
-        print(f"... truncated {len(summary.steps) - top_steps} steps; use --top-steps to show more")
+    print("scenario,step,layer_pairs,overlap,current,previous,rate,jaccard")
+    for scenario in SCENARIOS:
+        scenario_steps = summary.steps.get(scenario, {})
+        for step, bucket in sorted(scenario_steps.items())[:top_steps]:
+            print(
+                f"{scenario},{step},{bucket.pairs},{bucket.overlap},{bucket.current_count},"
+                f"{bucket.previous_count},{bucket.rate:.6f},{bucket.jaccard:.6f}"
+            )
+        if len(scenario_steps) > top_steps:
+            print(f"... truncated {len(scenario_steps) - top_steps} {scenario} steps; use --top-steps to show more")
 
 
 def main() -> int:
@@ -212,6 +263,7 @@ def main() -> int:
             args.layer_csv,
             (
                 {
+                    "scenario": scenario,
                     "layer": layer,
                     "pairs": bucket.pairs,
                     "overlap": bucket.overlap,
@@ -220,7 +272,8 @@ def main() -> int:
                     "rate": bucket.rate,
                     "jaccard": bucket.jaccard,
                 }
-                for layer, bucket in sorted(summary.layers.items())
+                for scenario in SCENARIOS
+                for layer, bucket in sorted(summary.layers.get(scenario, {}).items())
             ),
         )
     if args.step_csv:
@@ -228,6 +281,7 @@ def main() -> int:
             args.step_csv,
             (
                 {
+                    "scenario": scenario,
                     "step": step,
                     "layer_pairs": bucket.pairs,
                     "overlap": bucket.overlap,
@@ -236,7 +290,8 @@ def main() -> int:
                     "rate": bucket.rate,
                     "jaccard": bucket.jaccard,
                 }
-                for step, bucket in sorted(summary.steps.items())
+                for scenario in SCENARIOS
+                for step, bucket in sorted(summary.steps.get(scenario, {}).items())
             ),
         )
 
