@@ -65,10 +65,11 @@ class ExpertOffloadManager:
         self.num_total_experts = None  # set in create_weights
         self._expert_tensor_dump_enabled = self.offload_config.expert_tensor_dump_enabled
         self._expert_tensor_dump_path = self.offload_config.expert_tensor_dump_path or "expert_tensor_dump.pt"
+        self._expert_tensor_dump_flush_interval = self.offload_config.expert_tensor_dump_flush_interval
         self._expert_tensor_dump_records: list[dict[str, int | torch.Tensor]] = []
         self._expert_tensor_dump_calls: list[int] = []
         self._expert_tensor_dump_registered = False
-        self._expert_tensor_dump_flushed = False
+        self._expert_tensor_dump_last_flushed_step = 0
 
         ExpertOffloadManager._instance = self
 
@@ -639,11 +640,22 @@ class ExpertOffloadManager:
                 "experts": experts,
             }
         )
+        self._maybe_flush_expert_tensor_dump()
+
+    def _maybe_flush_expert_tensor_dump(self) -> None:
+        if self._expert_tensor_dump_flush_interval == 0:
+            return
+        if not self._expert_tensor_dump_calls:
+            return
+        completed_step = min(self._expert_tensor_dump_calls)
+        if completed_step - self._expert_tensor_dump_last_flushed_step < self._expert_tensor_dump_flush_interval:
+            return
+        self._flush_expert_tensor_dump()
+        self._expert_tensor_dump_last_flushed_step = completed_step
 
     def _flush_expert_tensor_dump(self) -> None:
-        if not self._expert_tensor_dump_enabled or self._expert_tensor_dump_flushed:
+        if not self._expert_tensor_dump_enabled:
             return
-        self._expert_tensor_dump_flushed = True
         if not self._expert_tensor_dump_records:
             return
         path = Path(self._expert_tensor_dump_path).expanduser()

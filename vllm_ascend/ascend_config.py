@@ -580,6 +580,7 @@ class ExpertOffloadConfig:
         "expert_map_path": None,
         "expert_tensor_dump_enabled": False,
         "expert_tensor_dump_path": None,
+        "expert_tensor_dump_flush_interval": 198,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -623,6 +624,10 @@ class ExpertOffloadConfig:
             self.config["expert_tensor_dump_path"], str
         ):
             raise TypeError("expert_tensor_dump_path must be a string or None")
+        if not isinstance(self.config["expert_tensor_dump_flush_interval"], int):
+            raise TypeError("expert_tensor_dump_flush_interval must be an integer")
+        if self.config["expert_tensor_dump_flush_interval"] < 0:
+            raise ValueError("expert_tensor_dump_flush_interval must >= 0")
 
 
 _ASCEND_CONFIG: AscendConfig | None = None
