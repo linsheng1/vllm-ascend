@@ -50,6 +50,24 @@ class AscendConfig:
         weight_prefetch_config = additional_config.get("weight_prefetch_config", {})
         self.weight_prefetch_config = WeightPrefetchConfig(weight_prefetch_config)
 
+        expert_offload_config = additional_config.get("expert_offload_config", {})
+        self.expert_tensor_dump_enabled = additional_config.get(
+            "expert_tensor_dump_enabled",
+            expert_offload_config.get("expert_tensor_dump_enabled", False),
+        )
+        self.expert_tensor_dump_path = additional_config.get(
+            "expert_tensor_dump_path",
+            expert_offload_config.get("expert_tensor_dump_path", None),
+        )
+        self.expert_tensor_dump_flush_interval = additional_config.get(
+            "expert_tensor_dump_flush_interval",
+            expert_offload_config.get("expert_tensor_dump_flush_interval", 198),
+        )
+        self.expert_tensor_dump_max_tokens = additional_config.get(
+            "expert_tensor_dump_max_tokens",
+            expert_offload_config.get("expert_tensor_dump_max_tokens", 1),
+        )
+
         # Dump / PrecisionDebugger configuration
         self.dump_config_path = additional_config.get("dump_config_path", None)
         self.layer_sharding = additional_config.get("layer_sharding", None)

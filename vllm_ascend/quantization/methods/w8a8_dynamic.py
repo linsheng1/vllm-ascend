@@ -256,6 +256,10 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         w1_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
         w2_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
 
+        from vllm_ascend.expert_tensor_dump import record_expert_topk_tensor
+
+        record_expert_topk_tensor(layer, topk_ids)
+
         final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
                 hidden_states=x,
