@@ -617,6 +617,8 @@ class ExpertOffloadConfig:
 
     _defaults = {
         "expert_offload": False,
+        "expert_offload_simulation": False,
+        "expert_offload_simulation_log_updates": True,
         "num_device_experts": 32,
         "num_device_layers": 2,
         "expert_map_path": None,
@@ -657,6 +659,10 @@ class ExpertOffloadConfig:
             raise ValueError(f"num_device_layers must >= 1; got {self.config['num_device_layers']} instead")
         if not isinstance(self.config["expert_offload"], bool):
             raise TypeError("expert_offload must be a boolean")
+        if not isinstance(self.config["expert_offload_simulation"], bool):
+            raise TypeError("expert_offload_simulation must be a boolean")
+        if not isinstance(self.config["expert_offload_simulation_log_updates"], bool):
+            raise TypeError("expert_offload_simulation_log_updates must be a boolean")
 
 
 _ASCEND_CONFIG: AscendConfig | None = None
