@@ -15,6 +15,11 @@ except ModuleNotFoundError:
 
 from vllm_ascend.expert_offload.lrc_policy import LRCExpertCachePolicy
 
+try:
+    from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+except (ImportError, ModuleNotFoundError):
+    _EXTRA_CTX = None
+
 
 @dataclass(frozen=True)
 class ExpertOffloadSimulationRecord:
@@ -94,7 +99,12 @@ class ExpertOffloadSimulator:
 
         policy = self._get_policy(layer_idx, num_total_experts)
         topk_ids_cpu = topk_ids.detach().cpu()
-        topk_weights_cpu = topk_weights.detach().cpu() if topk_weights is not None else None
+        use_router_scores = (
+            topk_weights is not None
+            and self.router_weight != 0
+            and not getattr(_EXTRA_CTX, "capturing", False)
+        )
+        topk_weights_cpu = topk_weights.detach().cpu() if use_router_scores else None
         router_scores = topk_weights_cpu.tolist() if topk_weights_cpu is not None else None
         needed_set = policy.observe(
             layer_idx=0,
@@ -108,12 +118,14 @@ class ExpertOffloadSimulator:
             if slot >= 0
         }
         on_device = set(slot_owner.values())
-        hits = sorted(needed_set & on_device)
-        misses = sorted(needed_set - on_device)
+        hit_set = needed_set & on_device
+        miss_set = needed_set - on_device
+        hits = sorted(hit_set)
+        misses = sorted(miss_set)
 
         loaded: list[int] = []
         evicted: list[int] = []
-        for eid in misses:
+        for eid in miss_set:
             victim = policy.choose_victim(
                 layer_idx=0,
                 slot_owner=slot_owner,
