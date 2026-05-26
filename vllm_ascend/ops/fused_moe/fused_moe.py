@@ -199,7 +199,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             from vllm_ascend.expert_offload.simulator import (
                 maybe_record_expert_offload_simulation,
             )
-            maybe_record_expert_offload_simulation(layer, topk_ids)
+            maybe_record_expert_offload_simulation(layer, topk_ids, topk_weights)
 
         if zero_expert_num > 0 and zero_expert_type is not None:
             if vllm_version_is("0.20.2"):

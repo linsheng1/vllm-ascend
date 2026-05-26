@@ -268,7 +268,7 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             from vllm_ascend.expert_offload.simulator import (
                 maybe_record_expert_offload_simulation,
             )
-            maybe_record_expert_offload_simulation(layer, topk_ids)
+            maybe_record_expert_offload_simulation(layer, topk_ids, topk_weights)
 
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         fused_scale_flag = (

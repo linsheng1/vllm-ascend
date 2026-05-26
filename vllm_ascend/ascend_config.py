@@ -622,6 +622,12 @@ class ExpertOffloadConfig:
         "num_device_experts": 32,
         "num_device_layers": 2,
         "expert_map_path": None,
+        "cache_recent_window": 32,
+        "cache_ema_beta": 0.9,
+        "cache_recent_weight": 1.0,
+        "cache_ema_weight": 0.5,
+        "cache_router_weight": 0.3,
+        "cache_age_weight": 0.01,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -663,6 +669,21 @@ class ExpertOffloadConfig:
             raise TypeError("expert_offload_simulation must be a boolean")
         if not isinstance(self.config["expert_offload_simulation_log_updates"], bool):
             raise TypeError("expert_offload_simulation_log_updates must be a boolean")
+        if not isinstance(self.config["cache_recent_window"], int):
+            raise TypeError("cache_recent_window must be an integer")
+        if self.config["cache_recent_window"] < 1:
+            raise ValueError("cache_recent_window must >= 1")
+        for key in (
+            "cache_ema_beta",
+            "cache_recent_weight",
+            "cache_ema_weight",
+            "cache_router_weight",
+            "cache_age_weight",
+        ):
+            if not isinstance(self.config[key], (int, float)):
+                raise TypeError(f"{key} must be a number")
+        if not 0 <= self.config["cache_ema_beta"] < 1:
+            raise ValueError("cache_ema_beta must be in [0, 1)")
 
 
 _ASCEND_CONFIG: AscendConfig | None = None

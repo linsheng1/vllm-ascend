@@ -305,9 +305,18 @@ class NPUModelRunner(GPUModelRunner):
             if has_expert_offload_manager():
                 self.offload_manager = get_expert_offload_manager()
         elif self.ascend_config.expert_offload_config.expert_offload_simulation:
+            hf_config = self.vllm_config.model_config.hf_config
             maybe_init_expert_offload_simulator(
                 num_device_experts=self.ascend_config.expert_offload_config.num_device_experts,
                 log_updates=self.ascend_config.expert_offload_config.expert_offload_simulation_log_updates,
+                topk=hf_config.num_experts_per_tok,
+                num_layers=getattr(hf_config, "num_hidden_layers", 1),
+                recent_window=self.ascend_config.expert_offload_config.cache_recent_window,
+                ema_beta=self.ascend_config.expert_offload_config.cache_ema_beta,
+                recent_weight=self.ascend_config.expert_offload_config.cache_recent_weight,
+                ema_weight=self.ascend_config.expert_offload_config.cache_ema_weight,
+                router_weight=self.ascend_config.expert_offload_config.cache_router_weight,
+                age_weight=self.ascend_config.expert_offload_config.cache_age_weight,
             )
 
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
