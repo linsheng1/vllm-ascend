@@ -620,6 +620,11 @@ class ExpertOffloadConfig:
         "num_device_experts": 32,
         "num_device_layers": 2,
         "expert_map_path": None,
+        "finemoe_data_simulation": False,
+        "finemoe_data_simulation_log_updates": True,
+        "finemoe_data_simulation_dump_path": None,
+        "finemoe_data_simulation_dump_interval_steps": 198,
+        "finemoe_data_simulation_decode_max_tokens": 1,
     }
 
     def __init__(self, user_config: dict | None = None):
@@ -657,6 +662,28 @@ class ExpertOffloadConfig:
             raise ValueError(f"num_device_layers must >= 1; got {self.config['num_device_layers']} instead")
         if not isinstance(self.config["expert_offload"], bool):
             raise TypeError("expert_offload must be a boolean")
+        if not isinstance(self.config["finemoe_data_simulation"], bool):
+            raise TypeError("finemoe_data_simulation must be a boolean")
+        if not isinstance(self.config["finemoe_data_simulation_log_updates"], bool):
+            raise TypeError("finemoe_data_simulation_log_updates must be a boolean")
+        if self.config["finemoe_data_simulation_dump_path"] is not None and not isinstance(
+            self.config["finemoe_data_simulation_dump_path"], str
+        ):
+            raise TypeError("finemoe_data_simulation_dump_path must be a string")
+        if not isinstance(self.config["finemoe_data_simulation_dump_interval_steps"], int):
+            raise TypeError("finemoe_data_simulation_dump_interval_steps must be an integer")
+        if self.config["finemoe_data_simulation_dump_interval_steps"] < 0:
+            raise ValueError(
+                "finemoe_data_simulation_dump_interval_steps must >= 0; got "
+                f"{self.config['finemoe_data_simulation_dump_interval_steps']} instead"
+            )
+        if not isinstance(self.config["finemoe_data_simulation_decode_max_tokens"], int):
+            raise TypeError("finemoe_data_simulation_decode_max_tokens must be an integer")
+        if self.config["finemoe_data_simulation_decode_max_tokens"] < 0:
+            raise ValueError(
+                "finemoe_data_simulation_decode_max_tokens must >= 0; got "
+                f"{self.config['finemoe_data_simulation_decode_max_tokens']} instead"
+            )
 
 
 _ASCEND_CONFIG: AscendConfig | None = None

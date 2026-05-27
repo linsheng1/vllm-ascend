@@ -264,6 +264,10 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 except ValueError:
                     layer_idx = 0
                 prefill_slot = layer_idx % len(mgr._prefill_w13)
+        elif getattr(layer, 'enable_finemoe_data_simulation', False):
+            from vllm_ascend.expert_offload import maybe_record_finemoe_data
+
+            maybe_record_finemoe_data(layer, topk_ids, topk_weights)
 
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         fused_scale_flag = (

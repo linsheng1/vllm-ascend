@@ -195,6 +195,10 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 except ValueError:
                     layer_idx = 0
                 prefill_slot = layer_idx % len(mgr._prefill_w13)
+        elif getattr(layer, 'enable_finemoe_data_simulation', False):
+            from vllm_ascend.expert_offload import maybe_record_finemoe_data
+
+            maybe_record_finemoe_data(layer, topk_ids, topk_weights)
 
         if zero_expert_num > 0 and zero_expert_type is not None:
             if vllm_version_is("0.20.2"):
@@ -395,6 +399,9 @@ class AscendFusedMoE(FusedMoE):
         _offload_cfg = get_ascend_config().expert_offload_config
         self.enable_expert_offload, _offload_emap = init_expert_offload_config(
             _offload_cfg, kwargs.get("num_experts", 0))
+        self.enable_finemoe_data_simulation = (
+            not self.enable_expert_offload and _offload_cfg.finemoe_data_simulation
+        )
         if _offload_emap is not None:
             self._expert_map_offload = _offload_emap
             self._expert_map_offload_count = _offload_cfg.num_device_experts

@@ -125,6 +125,7 @@ from vllm_ascend.expert_offload.expert_offload_manager import (
     has_expert_offload_manager,
     get_expert_offload_manager,
 )
+from vllm_ascend.expert_offload.finemoe_simulator import maybe_init_finemoe_data_simulator
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.quantization.utils import enable_fa_quant
@@ -301,6 +302,18 @@ class NPUModelRunner(GPUModelRunner):
             maybe_init_expert_offload_manager(self.vllm_config)
             if has_expert_offload_manager():
                 self.offload_manager = get_expert_offload_manager()
+        elif self.ascend_config.expert_offload_config.finemoe_data_simulation:
+            hf_config = self.vllm_config.model_config.hf_config
+            maybe_init_finemoe_data_simulator(
+                enabled=True,
+                topk=getattr(hf_config, "num_experts_per_tok", 1),
+                decode_max_tokens=self.ascend_config.expert_offload_config.finemoe_data_simulation_decode_max_tokens,
+                dump_path=self.ascend_config.expert_offload_config.finemoe_data_simulation_dump_path,
+                dump_interval_steps=(
+                    self.ascend_config.expert_offload_config.finemoe_data_simulation_dump_interval_steps
+                ),
+                log_updates=self.ascend_config.expert_offload_config.finemoe_data_simulation_log_updates,
+            )
 
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
